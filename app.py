@@ -1,4 +1,5 @@
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
@@ -67,17 +68,20 @@ def pick_most_recent_chat(chats: Dict[str, dict]) -> str:
     return most_recent["id"]
 
 
-def call_hf_api(messages: List[dict], token: str, model: str) -> str:
+def stream_hf_api(messages: List[dict], token: str, model: str):
     url = "https://router.huggingface.co/v1/chat/completions"
     headers = {"Authorization": f"Bearer {token}"}
     payload = {
         "model": model,
         "messages": messages,
         "max_tokens": 512,
+        "stream": True,
     }
 
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
+        response = requests.post(
+            url, headers=headers, json=payload, timeout=30, stream=True
+        )
     except requests.RequestException as exc:
         raise RuntimeError(f"Network error: {exc}") from exc
 
@@ -89,17 +93,27 @@ def call_hf_api(messages: List[dict], token: str, model: str) -> str:
             error_message = response.text
         raise RuntimeError(f"API error {response.status_code}: {error_message}")
 
-    data = response.json()
-    if isinstance(data, dict) and data.get("error"):
-        raise RuntimeError(f"API error: {data['error']}")
-
-    if isinstance(data, dict) and data.get("choices"):
-        choice = data["choices"][0]
-        message = choice.get("message", {})
-        content = message.get("content", "")
-        return content.strip()
-
-    raise RuntimeError("Unexpected API response format.")
+    for raw_line in response.iter_lines(decode_unicode=True):
+        if not raw_line:
+            continue
+        if not raw_line.startswith("data:"):
+            continue
+        data_str = raw_line.replace("data:", "", 1).strip()
+        if data_str == "[DONE]":
+            break
+        try:
+            payload = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and payload.get("error"):
+            raise RuntimeError(f"API error: {payload['error']}")
+        choices = payload.get("choices", [])
+        if not choices:
+            continue
+        delta = choices[0].get("delta", {})
+        content = delta.get("content", "")
+        if content:
+            yield content
 
 
 st.title(APP_TITLE)
@@ -181,12 +195,14 @@ if not active_chat:
 if not active_chat["messages"]:
     test_message = {"role": "user", "content": "Hello!"}
     active_chat["messages"].append(test_message)
+    assistant_text = ""
     try:
-        reply = call_hf_api(active_chat["messages"], hf_token, hf_model)
+        for chunk in stream_hf_api(active_chat["messages"], hf_token, hf_model):
+            assistant_text += chunk
     except RuntimeError as err:
         st.error(str(err))
-        reply = "Sorry, I ran into a problem reaching the API. Please try again."
-    active_chat["messages"].append({"role": "assistant", "content": reply})
+        assistant_text = "Sorry, I ran into a problem reaching the API. Please try again."
+    active_chat["messages"].append({"role": "assistant", "content": assistant_text})
     save_chat_to_disk(active_chat)
 
 messages_container = st.container(height=500)
@@ -205,14 +221,20 @@ if user_prompt:
     if active_chat["title"] == "New chat":
         active_chat["title"] = user_prompt[:30] + ("..." if len(user_prompt) > 30 else "")
 
-    # Call API and add assistant response
+    # Call API and add assistant response (streamed)
     try:
-        reply = call_hf_api(active_chat["messages"], hf_token, hf_model)
+        assistant_text = ""
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            for chunk in stream_hf_api(active_chat["messages"], hf_token, hf_model):
+                assistant_text += chunk
+                placeholder.write(assistant_text)
+                time.sleep(0.02)
     except RuntimeError as err:
         st.error(str(err))
-        reply = "Sorry, I ran into a problem reaching the API. Please try again."
+        assistant_text = "Sorry, I ran into a problem reaching the API. Please try again."
 
-    active_chat["messages"].append({"role": "assistant", "content": reply})
+    active_chat["messages"].append({"role": "assistant", "content": assistant_text})
 
     save_chat_to_disk(active_chat)
     st.rerun()
