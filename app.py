@@ -105,7 +105,17 @@ def parse_json_from_text(text: str) -> dict:
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        return {}
+        pass
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        snippet = cleaned[start : end + 1]
+        try:
+            return json.loads(snippet)
+        except json.JSONDecodeError:
+            return {}
+    return {}
 
 
 def pick_most_recent_chat(chats: Dict[str, dict]) -> str:
@@ -164,13 +174,16 @@ def stream_hf_api(messages: List[dict], token: str, model: str):
             yield content
 
 
-def call_hf_api(messages: List[dict], token: str, model: str) -> dict:
+def call_hf_api(
+    messages: List[dict], token: str, model: str, max_tokens: int, temperature: float
+) -> dict:
     url = "https://router.huggingface.co/v1/chat/completions"
     headers = {"Authorization": f"Bearer {token}"}
     payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": 256,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
     }
 
     try:
@@ -231,8 +244,12 @@ chat_list_container = st.sidebar.container(height=400)
 
 with st.sidebar.expander("User Memory", expanded=False):
     st.json(st.session_state.user_memory)
+    if st.session_state.get("last_memory_raw"):
+        st.caption("Last extraction (raw):")
+        st.code(st.session_state.last_memory_raw)
     if st.button("Clear Memory"):
         st.session_state.user_memory = {}
+        st.session_state.last_memory_raw = ""
         save_memory(st.session_state.user_memory)
         st.rerun()
 
@@ -282,17 +299,19 @@ if not active_chat:
 # Part A test: if the chat is empty, send a single hardcoded test message once
 def extract_memory_from_user_message(user_text: str) -> dict:
     prompt = (
-        "Given this user message, extract any personal facts or preferences as a JSON object. "
-        "If none, return {}. Only return valid JSON.\n\n"
+        "Extract any personal facts or preferences from the user message as JSON. "
+        "Use only these keys when relevant: name, language, interests, communication_style, "
+        "favorite_topics, location. If none, return {}. Only return valid JSON.\n\n"
         f"User message: {user_text}"
     )
     extraction_messages = [
         {"role": "system", "content": "You are a JSON extraction assistant."},
         {"role": "user", "content": prompt},
     ]
-    data = call_hf_api(extraction_messages, hf_token, hf_model)
+    data = call_hf_api(extraction_messages, hf_token, hf_model, 128, 0.0)
     try:
         content = data["choices"][0]["message"]["content"]
+        st.session_state.last_memory_raw = content
         return parse_json_from_text(content)
     except Exception:
         return {}
