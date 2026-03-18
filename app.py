@@ -12,6 +12,7 @@ st.set_page_config(page_title="My AI Chat", layout="wide")
 APP_TITLE = "My AI Chat"
 DEFAULT_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 CHATS_DIR = Path("chats")
+MEMORY_FILE = Path("memory.json")
 
 
 def ensure_chats_dir() -> None:
@@ -58,6 +59,53 @@ def new_chat() -> dict:
     }
     save_chat_to_disk(chat)
     return chat
+
+
+def load_memory() -> dict:
+    if not MEMORY_FILE.exists():
+        return {}
+    try:
+        return json.loads(MEMORY_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def save_memory(memory: dict) -> None:
+    MEMORY_FILE.write_text(json.dumps(memory, indent=2))
+
+
+def merge_memory(existing: dict, updates: dict) -> dict:
+    merged = existing.copy()
+    for key, value in updates.items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        if value == {} or value == []:
+            continue
+        merged[key] = value
+    return merged
+
+
+def memory_to_system_prompt(memory: dict) -> str:
+    if not memory:
+        return ""
+    lines = ["You are a helpful assistant. Use these user preferences to personalize responses:"]
+    for key, value in memory.items():
+        lines.append(f"- {key}: {value}")
+    return "\n".join(lines)
+
+
+def parse_json_from_text(text: str) -> dict:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`")
+        # remove optional language label like json
+        cleaned = cleaned.replace("json", "", 1).strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        return {}
 
 
 def pick_most_recent_chat(chats: Dict[str, dict]) -> str:
@@ -116,6 +164,35 @@ def stream_hf_api(messages: List[dict], token: str, model: str):
             yield content
 
 
+def call_hf_api(messages: List[dict], token: str, model: str) -> dict:
+    url = "https://router.huggingface.co/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {token}"}
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": 256,
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=30)
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Network error: {exc}") from exc
+
+    if response.status_code != 200:
+        try:
+            error_payload = response.json()
+            error_message = error_payload.get("error", "Unknown error")
+        except Exception:
+            error_message = response.text
+        raise RuntimeError(f"API error {response.status_code}: {error_message}")
+
+    data = response.json()
+    if isinstance(data, dict) and data.get("error"):
+        raise RuntimeError(f"API error: {data['error']}")
+
+    return data
+
+
 st.title(APP_TITLE)
 
 # Load token safely
@@ -125,6 +202,10 @@ if not hf_token:
     st.stop()
 
 hf_model = st.secrets.get("HF_MODEL", DEFAULT_MODEL)
+
+# Load memory once
+if "user_memory" not in st.session_state:
+    st.session_state.user_memory = load_memory()
 
 # Load chats into session state once
 if "chats" not in st.session_state:
@@ -147,6 +228,13 @@ if st.sidebar.button("New Chat"):
     st.rerun()
 
 chat_list_container = st.sidebar.container(height=400)
+
+with st.sidebar.expander("User Memory", expanded=False):
+    st.json(st.session_state.user_memory)
+    if st.button("Clear Memory"):
+        st.session_state.user_memory = {}
+        save_memory(st.session_state.user_memory)
+        st.rerun()
 
 # Sort chats by created_at (newest first)
 chat_items = sorted(
@@ -192,17 +280,53 @@ if not active_chat:
     st.stop()
 
 # Part A test: if the chat is empty, send a single hardcoded test message once
+def extract_memory_from_user_message(user_text: str) -> dict:
+    prompt = (
+        "Given this user message, extract any personal facts or preferences as a JSON object. "
+        "If none, return {}. Only return valid JSON.\n\n"
+        f"User message: {user_text}"
+    )
+    extraction_messages = [
+        {"role": "system", "content": "You are a JSON extraction assistant."},
+        {"role": "user", "content": prompt},
+    ]
+    data = call_hf_api(extraction_messages, hf_token, hf_model)
+    try:
+        content = data["choices"][0]["message"]["content"]
+        return parse_json_from_text(content)
+    except Exception:
+        return {}
+
+
+def build_messages_with_memory(messages: List[dict], memory: dict) -> List[dict]:
+    system_prompt = memory_to_system_prompt(memory)
+    if system_prompt:
+        return [{"role": "system", "content": system_prompt}] + messages
+    return messages
+
+
 if not active_chat["messages"]:
     test_message = {"role": "user", "content": "Hello!"}
     active_chat["messages"].append(test_message)
     assistant_text = ""
     try:
-        for chunk in stream_hf_api(active_chat["messages"], hf_token, hf_model):
+        messages_with_memory = build_messages_with_memory(
+            active_chat["messages"], st.session_state.user_memory
+        )
+        for chunk in stream_hf_api(messages_with_memory, hf_token, hf_model):
             assistant_text += chunk
     except RuntimeError as err:
         st.error(str(err))
         assistant_text = "Sorry, I ran into a problem reaching the API. Please try again."
     active_chat["messages"].append({"role": "assistant", "content": assistant_text})
+    try:
+        updates = extract_memory_from_user_message(test_message["content"])
+        st.session_state.user_memory = merge_memory(
+            st.session_state.user_memory, updates
+        )
+        save_memory(st.session_state.user_memory)
+    except RuntimeError:
+        pass
     save_chat_to_disk(active_chat)
 
 messages_container = st.container(height=500)
@@ -223,10 +347,13 @@ if user_prompt:
 
     # Call API and add assistant response (streamed)
     try:
+        messages_with_memory = build_messages_with_memory(
+            active_chat["messages"], st.session_state.user_memory
+        )
         assistant_text = ""
         with st.chat_message("assistant"):
             placeholder = st.empty()
-            for chunk in stream_hf_api(active_chat["messages"], hf_token, hf_model):
+            for chunk in stream_hf_api(messages_with_memory, hf_token, hf_model):
                 assistant_text += chunk
                 placeholder.write(assistant_text)
                 time.sleep(0.02)
@@ -235,6 +362,16 @@ if user_prompt:
         assistant_text = "Sorry, I ran into a problem reaching the API. Please try again."
 
     active_chat["messages"].append({"role": "assistant", "content": assistant_text})
+
+    # Extract memory from the latest user message
+    try:
+        updates = extract_memory_from_user_message(user_prompt)
+        st.session_state.user_memory = merge_memory(
+            st.session_state.user_memory, updates
+        )
+        save_memory(st.session_state.user_memory)
+    except RuntimeError:
+        pass
 
     save_chat_to_disk(active_chat)
     st.rerun()
