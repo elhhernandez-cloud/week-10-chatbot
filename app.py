@@ -81,7 +81,7 @@ def build_prompt(messages: List[dict]) -> str:
 
 
 def call_hf_api(messages: List[dict], token: str, model: str) -> str:
-    url = f"https://api-inference.huggingface.co/models/{model}"
+    url = f"https://router.huggingface.co/models/{model}"
     headers = {"Authorization": f"Bearer {token}"}
     payload = {
         "inputs": build_prompt(messages),
