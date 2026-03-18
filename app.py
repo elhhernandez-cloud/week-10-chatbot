@@ -9,7 +9,7 @@ import streamlit as st
 st.set_page_config(page_title="My AI Chat", layout="wide")
 
 APP_TITLE = "My AI Chat"
-DEFAULT_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+DEFAULT_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 CHATS_DIR = Path("chats")
 
 
@@ -67,29 +67,13 @@ def pick_most_recent_chat(chats: Dict[str, dict]) -> str:
     return most_recent["id"]
 
 
-def build_prompt(messages: List[dict]) -> str:
-    lines = []
-    for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if role == "assistant":
-            lines.append(f"Assistant: {content}")
-        else:
-            lines.append(f"User: {content}")
-    lines.append("Assistant:")
-    return "\n".join(lines)
-
-
 def call_hf_api(messages: List[dict], token: str, model: str) -> str:
-    url = f"https://router.huggingface.co/models/{model}"
+    url = "https://router.huggingface.co/v1/chat/completions"
     headers = {"Authorization": f"Bearer {token}"}
     payload = {
-        "inputs": build_prompt(messages),
-        "parameters": {
-            "max_new_tokens": 200,
-            "temperature": 0.7,
-            "return_full_text": False,
-        },
+        "model": model,
+        "messages": messages,
+        "max_tokens": 512,
     }
 
     try:
@@ -109,9 +93,11 @@ def call_hf_api(messages: List[dict], token: str, model: str) -> str:
     if isinstance(data, dict) and data.get("error"):
         raise RuntimeError(f"API error: {data['error']}")
 
-    if isinstance(data, list) and data:
-        generated = data[0].get("generated_text", "")
-        return generated.strip()
+    if isinstance(data, dict) and data.get("choices"):
+        choice = data["choices"][0]
+        message = choice.get("message", {})
+        content = message.get("content", "")
+        return content.strip()
 
     raise RuntimeError("Unexpected API response format.")
 
