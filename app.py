@@ -274,7 +274,7 @@ for chat in chat_items:
                 st.rerun()
             st.caption(timestamp)
         with cols[1]:
-            if st.button("x", key=f"delete_{chat['id']}"):
+            if st.button("Delete", key=f"delete_{chat['id']}"):
                 delete_chat_from_disk(chat["id"])
                 del st.session_state.chats[chat["id"]]
 
